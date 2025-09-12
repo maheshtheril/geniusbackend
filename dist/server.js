@@ -1,0 +1,30 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+var _a;
+Object.defineProperty(exports, "__esModule", { value: true });
+const express_1 = __importDefault(require("express"));
+const cookie_parser_1 = __importDefault(require("cookie-parser"));
+const cors_1 = __importDefault(require("cors"));
+const auth_js_1 = require("./routes/auth.js");
+const me_js_1 = require("./routes/me.js");
+const leads_js_1 = require("./routes/leads.js");
+const leads_kanban_js_1 = require("./routes/leads.kanban.js");
+const leads_stage_js_1 = require("./routes/leads.stage.js");
+const leads_reports_js_1 = require("./routes/leads.reports.js");
+const requireAuth_js_1 = require("./util/requireAuth.js");
+const setTenant_js_1 = require("./mw/setTenant.js");
+const app = (0, express_1.default)();
+app.use((0, cors_1.default)({ origin: ((_a = process.env.CORS_ORIGIN) === null || _a === void 0 ? void 0 : _a.split(',')) || ["http://localhost:5173"], credentials: true }));
+app.use(express_1.default.json());
+app.use((0, cookie_parser_1.default)());
+app.use(setTenant_js_1.setTenant);
+app.use("/api/auth", auth_js_1.authRouter);
+app.use("/api/me", requireAuth_js_1.requireAuth, me_js_1.meRouter);
+app.use("/api/leads", requireAuth_js_1.requireAuth, leads_js_1.leadsRouter);
+app.use("/api/leads/kanban", requireAuth_js_1.requireAuth, leads_kanban_js_1.leadsKanbanRouter);
+app.use("/api/leads/reports", requireAuth_js_1.requireAuth, leads_reports_js_1.leadsReportsRouter);
+app.use("/api/leads", requireAuth_js_1.requireAuth, leads_stage_js_1.leadsStageRouter); // patch stage
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`API on :${PORT}`));
