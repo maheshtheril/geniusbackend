@@ -8,7 +8,8 @@
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
     "strict": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "types": ["node"]           // <-- ensures 'process', 'crypto' types, etc.
   },
   "include": ["src"]
 }
