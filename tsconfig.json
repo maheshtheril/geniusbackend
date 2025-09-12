@@ -6,10 +6,9 @@
     "outDir": "dist",
     "rootDir": "src",
     "esModuleInterop": true,
-    "forceConsistentCasingInFileNames": true,
     "strict": true,
     "skipLibCheck": true,
-    "types": ["node"]           // <-- ensures 'process', 'crypto' types, etc.
+    "types": ["node"]   // keep this, now that @types/node is present
   },
   "include": ["src"]
 }
