@@ -105,53 +105,85 @@ async function ensureUser(email: string, plainPassword: string) {
  * - Seeds user with given email on first login attempt (idempotent).
  * - Issues sid/rid cookies.
  */
-authRouter.post("/login", async (req: any, res: any) => {
+/**
+ * POST /api/auth/seed-admin
+ * One-time, token-gated seeding endpoint to create minimal tables and an admin user.
+ * Headers:  X-Seed-Token: <ADMIN_SEED_TOKEN>
+ * Body:     { email: string, password: string }
+ */
+authRouter.post("/seed-admin", async (req: any, res: any) => {
   try {
+    const token = req.header("X-Seed-Token");
+    if (!token || token !== process.env.ADMIN_SEED_TOKEN) {
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+
     const { email, password } = req.body ?? {};
     if (!email || !password) {
-      return res.status(400).json({ error: "Email and password required" });
+      return res.status(400).json({ ok: false, error: "email and password required" });
     }
 
-    await bootstrapDbOnce();
+    // 1) Minimal schema (idempotent)
+    await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
 
-    // make sure user exists
-    const user = await ensureUser(email, password);
-    if (!user || user.is_active === false) {
-      return res.status(401).json({ error: "Invalid credentials" });
-    }
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS app_user (
+        id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        email       text UNIQUE NOT NULL,
+        password    text NOT NULL,
+        tenant_id   uuid NULL,
+        full_name   text,
+        role        text,
+        is_active   boolean NOT NULL DEFAULT true,
+        created_at  timestamptz NOT NULL DEFAULT now()
+      );
+    `);
 
-    // verify password
-    const ok = user.password ? await bcrypt.compare(password, user.password) : false;
-    if (!ok) return res.status(401).json({ error: "Invalid credentials" });
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS sessions (
+        sid             text PRIMARY KEY,
+        user_id         uuid NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+        tenant_id       uuid NULL,
+        device          text,
+        absolute_expiry timestamptz NOT NULL,
+        created_at      timestamptz NOT NULL DEFAULT now()
+      );
+    `);
 
-    // create session + refresh
-    const sid = uuid();
-    const rid = uuid();
-    const tokenHash = crypto.createHash("sha256").update(rid).digest("hex");
-    const absoluteExpiry = dayjs().add(8, "hours").toDate();
-    const refreshExpiry = dayjs().add(30, "days").toDate();
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS refresh_tokens (
+        rid                     text PRIMARY KEY,
+        sid                     text NOT NULL REFERENCES sessions(sid) ON DELETE CASCADE,
+        user_id                 uuid NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+        tenant_id               uuid NULL,
+        token_hash              text NOT NULL,
+        replaced_by_token_hash  text NULL,
+        revoked                 boolean NOT NULL DEFAULT false,
+        created_at              timestamptz NOT NULL DEFAULT now(),
+        expires_at              timestamptz NOT NULL
+      );
+    `);
 
+    // 2) Upsert admin user with bcrypt
+    const hash = await bcrypt.hash(password, 10);
     await pool.query(
-      `INSERT INTO sessions (sid, user_id, tenant_id, device, absolute_expiry, created_at)
-       VALUES ($1,$2,$3,$4,$5,NOW())
-       ON CONFLICT (sid) DO NOTHING`,
-      [sid, user.id, user.tenant_id ?? null, req.headers["user-agent"] || null, absoluteExpiry]
+      `INSERT INTO app_user (email, password, full_name, role, is_active)
+       VALUES ($1,$2,'Admin','admin',true)
+       ON CONFLICT (email) DO UPDATE
+         SET password = EXCLUDED.password,
+             full_name = 'Admin',
+             role = 'admin',
+             is_active = true`,
+      [email, hash]
     );
 
-    await pool.query(
-      `INSERT INTO refresh_tokens (
-         rid, sid, user_id, tenant_id, token_hash, replaced_by_token_hash, revoked, created_at, expires_at
-       ) VALUES ($1,$2,$3,$4,$5,NULL,false,NOW(),$6)`,
-      [rid, sid, user.id, user.tenant_id ?? null, tokenHash, refreshExpiry]
-    );
-
-    setCookies(res, sid, rid);
-    return res.json({ ok: true });
-  } catch (err: any) {
-    console.error("[AUTH /login] ERROR:", err);
-    return res.status(500).json({ error: "Login failed" });
+    return res.json({ ok: true, seeded: email });
+  } catch (e: any) {
+    console.error("[AUTH /seed-admin] ERROR:", e);
+    return res.status(500).json({ ok: false, error: e?.message || "seed failed" });
   }
 });
+
 
 /** POST /api/auth/logout */
 authRouter.post("/logout", async (req: any, res: any) => {
