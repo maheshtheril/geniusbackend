@@ -8,255 +8,176 @@ import dayjs from "dayjs";
 
 export const authRouter = Router();
 
-/* ------------------------------ Cookie helpers ----------------------------- */
-
-function makeCookieOptions() {
-  const crossSite = true; // set to false if same-origin
-  const opts: any = {
+/* ------------------------------ cookie helpers ----------------------------- */
+function cookieOpts() {
+  return {
     httpOnly: true,
-    sameSite: crossSite ? "none" : "lax",
+    sameSite: "none" as const,
     secure: true,
     path: "/",
   };
-  if (process.env.COOKIE_DOMAIN) {
-    opts.domain = process.env.COOKIE_DOMAIN;
-  }
-  return opts;
 }
-
-function setSessionCookies(res: any, sid: string, rid: string) {
-  const opts = makeCookieOptions();
+function setCookies(res: any, sid: string, rid: string) {
+  const opts = cookieOpts();
   res.cookie("sid", sid, opts);
   res.cookie("rid", rid, opts);
 }
-
-function clearSessionCookies(res: any) {
-  const opts = makeCookieOptions();
+function clearCookies(res: any) {
+  const opts = cookieOpts();
   res.clearCookie("sid", opts);
   res.clearCookie("rid", opts);
 }
 
-/* ------------------------------ Tenant helpers ----------------------------- */
+/* ------------------------------- bootstrap --------------------------------- */
+/** Create minimal schema if missing (safe to run multiple times). */
+let bootstrapped = false;
+async function bootstrapDbOnce() {
+  if (bootstrapped) return;
+  // extension + tables (no FK on tenant to avoid extra dependencies)
+  await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
 
-async function findTenantIdBySlug(tenantSlug?: string | null): Promise<string | null> {
-  if (!tenantSlug) return null;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS app_user (
+      id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      email       text UNIQUE NOT NULL,
+      password    text NOT NULL,
+      tenant_id   uuid NULL,
+      full_name   text,
+      role        text,
+      is_active   boolean NOT NULL DEFAULT true,
+      created_at  timestamptz NOT NULL DEFAULT now()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      sid             text PRIMARY KEY,
+      user_id         uuid NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+      tenant_id       uuid NULL,
+      device          text,
+      absolute_expiry timestamptz NOT NULL,
+      created_at      timestamptz NOT NULL DEFAULT now()
+    );
+  `);
+
+  /* Columns you listed earlier for refresh_tokens */
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS refresh_tokens (
+      rid                     text PRIMARY KEY,
+      sid                     text NOT NULL REFERENCES sessions(sid) ON DELETE CASCADE,
+      user_id                 uuid NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+      tenant_id               uuid NULL,
+      token_hash              text NOT NULL,
+      replaced_by_token_hash  text NULL,
+      revoked                 boolean NOT NULL DEFAULT false,
+      created_at              timestamptz NOT NULL DEFAULT now(),
+      expires_at              timestamptz NOT NULL
+    );
+  `);
+
+  bootstrapped = true;
+}
+
+/** Ensure the login email exists; if not, create with the given password (bcrypt). */
+async function ensureUser(email: string, plainPassword: string) {
   const { rows } = await pool.query(
-    `SELECT id FROM tenant WHERE slug = $1 LIMIT 1`,
-    [tenantSlug]
+    `SELECT id, password, tenant_id, is_active FROM app_user WHERE email=$1 LIMIT 1`,
+    [email]
   );
-  return rows[0]?.id ?? null;
-}
+  if (rows[0]) return rows[0];
 
-/* ------------------------- Table introspection utils ------------------------ */
-
-type ColSet = Set<string>;
-const tableColsCache: Record<string, ColSet> = {};
-
-async function getTableCols(table: string): Promise<ColSet> {
-  if (tableColsCache[table]) return tableColsCache[table];
-  const { rows } = await pool.query(
-    `
-    SELECT column_name
-    FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = $1
-    `,
-    [table]
+  const hash = await bcrypt.hash(plainPassword, 10);
+  const insert = await pool.query(
+    `INSERT INTO app_user (email, password, full_name, role, is_active)
+     VALUES ($1,$2,'Admin','admin',true)
+     RETURNING id, password, tenant_id, is_active`,
+    [email, hash]
   );
-  const set = new Set<string>(rows.map((r: any) => r.column_name));
-  tableColsCache[table] = set;
-  return set;
+  return insert.rows[0];
 }
 
-/* -------------------------- Smart insert helpers ---------------------------- */
-
-async function insertSession(params: {
-  sid: string;
-  user_id: string;
-  tenant_id: string | null;
-  device: string | null;
-  absolute_expiry: Date;
-}) {
-  const cols = await getTableCols("sessions");
-
-  const names: string[] = [];
-  const values: any[] = [];
-  let i = 1;
-
-  // required knowns (at least sid, user_id, absolute_expiry exist in your schema)
-  if (cols.has("sid")) { names.push("sid"); values.push(params.sid); }
-  if (cols.has("user_id")) { names.push("user_id"); values.push(params.user_id); }
-  if (cols.has("tenant_id")) { names.push("tenant_id"); values.push(params.tenant_id); }
-  if (cols.has("device")) { names.push("device"); values.push(params.device); }
-  if (cols.has("absolute_expiry")) { names.push("absolute_expiry"); values.push(params.absolute_expiry); }
-  if (cols.has("created_at")) { names.push("created_at"); values.push(new Date()); }
-
-  if (!names.length) throw new Error("sessions table has no expected columns");
-
-  const placeholders = names.map(() => `$${i++}`);
-  const sql = `INSERT INTO sessions (${names.join(",")}) VALUES (${placeholders.join(",")})`;
-  await pool.query(sql, values);
-}
-
-async function insertRefreshToken(params: {
-  rid: string;
-  sid: string;
-  user_id: string;
-  tenant_id: string | null;
-  token_hash: string;
-  expires_at: Date;
-}) {
-  const cols = await getTableCols("refresh_tokens");
-
-  const names: string[] = [];
-  const values: any[] = [];
-  let i = 1;
-
-  // common fields
-  if (cols.has("rid")) { names.push("rid"); values.push(params.rid); }
-  if (cols.has("sid")) { names.push("sid"); values.push(params.sid); }
-  if (cols.has("user_id")) { names.push("user_id"); values.push(params.user_id); }
-  if (cols.has("tenant_id")) { names.push("tenant_id"); values.push(params.tenant_id); }
-  if (cols.has("token_hash")) { names.push("token_hash"); values.push(params.token_hash); }
-  if (cols.has("replaced_by_token_hash")) { names.push("replaced_by_token_hash"); values.push(null); }
-  if (cols.has("revoked")) { names.push("revoked"); values.push(false); }
-  if (cols.has("created_at")) { names.push("created_at"); values.push(new Date()); }
-  if (cols.has("expires_at")) { names.push("expires_at"); values.push(params.expires_at); }
-
-  if (!names.length) throw new Error("refresh_tokens table has no expected columns");
-
-  const placeholders = names.map(() => `$${i++}`);
-  const sql = `INSERT INTO refresh_tokens (${names.join(",")}) VALUES (${placeholders.join(",")})`;
-  await pool.query(sql, values);
-}
-
-/* ---------------------------------- Routes --------------------------------- */
+/* --------------------------------- routes ---------------------------------- */
 
 /**
  * POST /api/auth/login
- * Body: { email, password, tenantSlug? }
+ * Body: { email, password }
+ * - Bootstraps tables.
+ * - Seeds user with given email on first login attempt (idempotent).
+ * - Issues sid/rid cookies.
  */
 authRouter.post("/login", async (req: any, res: any) => {
   try {
-    const { email, password, tenantSlug } = req.body ?? {};
+    const { email, password } = req.body ?? {};
     if (!email || !password) {
       return res.status(400).json({ error: "Email and password required" });
     }
 
-    // Optional tenant scoping
-    const tenantIdFromSlug = await findTenantIdBySlug(tenantSlug);
-    if (tenantSlug && !tenantIdFromSlug) {
-      return res.status(400).json({ error: "Invalid tenant" });
-    }
+    await bootstrapDbOnce();
 
-    // User fetch (tolerate password vs password_hash, missing is_active)
-    const { rows } = await pool.query(
-      `
-      SELECT
-        id,
-        email,
-        COALESCE(password, password_hash) AS password,
-        tenant_id,
-        COALESCE(is_active, true) AS is_active
-      FROM app_user
-      WHERE email = $1
-      LIMIT 1
-      `,
-      [email]
-    );
-
-    const user = rows[0];
+    // make sure user exists
+    const user = await ensureUser(email, password);
     if (!user || user.is_active === false) {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
-    if (tenantIdFromSlug && user.tenant_id && user.tenant_id !== tenantIdFromSlug) {
-      return res.status(401).json({ error: "Invalid credentials" });
-    }
-
+    // verify password
     const ok = user.password ? await bcrypt.compare(password, user.password) : false;
     if (!ok) return res.status(401).json({ error: "Invalid credentials" });
 
-    // Create session + refresh token
+    // create session + refresh
     const sid = uuid();
     const rid = uuid();
     const tokenHash = crypto.createHash("sha256").update(rid).digest("hex");
-    const effectiveTenantId = user.tenant_id ?? tenantIdFromSlug ?? null;
+    const absoluteExpiry = dayjs().add(8, "hours").toDate();
+    const refreshExpiry = dayjs().add(30, "days").toDate();
 
-    // If your schema requires tenant_id NOT NULL, enforce:
-    // if (!effectiveTenantId) return res.status(400).json({ error: "Tenant not resolved for user" });
+    await pool.query(
+      `INSERT INTO sessions (sid, user_id, tenant_id, device, absolute_expiry, created_at)
+       VALUES ($1,$2,$3,$4,$5,NOW())
+       ON CONFLICT (sid) DO NOTHING`,
+      [sid, user.id, user.tenant_id ?? null, req.headers["user-agent"] || null, absoluteExpiry]
+    );
 
-    await insertSession({
-      sid,
-      user_id: user.id,
-      tenant_id: effectiveTenantId,
-      device: (req.headers["user-agent"] as string) || null,
-      absolute_expiry: dayjs().add(8, "hours").toDate(),
-    });
+    await pool.query(
+      `INSERT INTO refresh_tokens (
+         rid, sid, user_id, tenant_id, token_hash, replaced_by_token_hash, revoked, created_at, expires_at
+       ) VALUES ($1,$2,$3,$4,$5,NULL,false,NOW(),$6)`,
+      [rid, sid, user.id, user.tenant_id ?? null, tokenHash, refreshExpiry]
+    );
 
-    await insertRefreshToken({
-      rid,
-      sid,
-      user_id: user.id,
-      tenant_id: effectiveTenantId,
-      token_hash: tokenHash,
-      expires_at: dayjs().add(30, "days").toDate(),
-    });
-
-    setSessionCookies(res, sid, rid);
+    setCookies(res, sid, rid);
     return res.json({ ok: true });
   } catch (err: any) {
     console.error("[AUTH /login] ERROR:", err);
-    if (process.env.DEBUG === "1") {
-      return res.status(500).json({ error: "Login failed", detail: String(err?.message || err) });
-    }
     return res.status(500).json({ error: "Login failed" });
   }
 });
 
-/**
- * POST /api/auth/logout
- * - Revokes refresh token and deletes session (if present).
- * - Always clears cookies.
- */
+/** POST /api/auth/logout */
 authRouter.post("/logout", async (req: any, res: any) => {
   try {
     const rid = req?.cookies?.rid as string | undefined;
     const sid = req?.cookies?.sid as string | undefined;
-
-    if (rid) {
-      await pool.query(`UPDATE refresh_tokens SET revoked = true WHERE rid = $1`, [rid]);
-    }
-    if (sid) {
-      await pool.query(`DELETE FROM sessions WHERE sid = $1`, [sid]);
-    }
-  } catch (err: any) {
-    console.error("[AUTH /logout] ERROR:", err);
+    if (rid) await pool.query(`UPDATE refresh_tokens SET revoked = true WHERE rid = $1`, [rid]);
+    if (sid) await pool.query(`DELETE FROM sessions WHERE sid = $1`, [sid]);
+  } catch (e) {
+    console.error("[AUTH /logout] ERROR:", (e as any)?.message);
   } finally {
-    clearSessionCookies(res);
+    clearCookies(res);
+    return res.json({ ok: true });
   }
-  return res.json({ ok: true });
 });
 
-/**
- * GET /api/auth/status
- * - Validates sid cookie against sessions + expiry; returns minimal user info.
- */
+/** GET /api/auth/status */
 authRouter.get("/status", async (req: any, res: any) => {
   try {
     const sid = req?.cookies?.sid as string | undefined;
-    if (!sid) {
-      return res.json({ ok: true, authenticated: false });
-    }
+    if (!sid) return res.json({ ok: true, authenticated: false });
 
     const { rows } = await pool.query(
       `
-      SELECT s.sid,
-             s.user_id,
-             s.tenant_id,
-             s.absolute_expiry,
-             u.email,
-             u.full_name,
-             u.role
+      SELECT s.sid, s.user_id, s.tenant_id, s.absolute_expiry,
+             u.email, u.full_name, u.role
       FROM sessions s
       JOIN app_user u ON u.id = s.user_id
       WHERE s.sid = $1
@@ -266,15 +187,10 @@ authRouter.get("/status", async (req: any, res: any) => {
     );
 
     const sess = rows[0];
-    if (!sess) {
-      clearSessionCookies(res);
-      return res.json({ ok: true, authenticated: false });
-    }
+    if (!sess) return res.json({ ok: true, authenticated: false });
 
-    const expired = dayjs(sess.absolute_expiry).isBefore(dayjs());
-    if (expired) {
+    if (dayjs(sess.absolute_expiry).isBefore(dayjs())) {
       await pool.query(`DELETE FROM sessions WHERE sid = $1`, [sid]);
-      clearSessionCookies(res);
       return res.json({ ok: true, authenticated: false });
     }
 
