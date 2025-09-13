@@ -12,6 +12,10 @@ import { leadsReportsRouter } from "./routes/leads.reports.js";
 import { requireAuth } from "./util/requireAuth.js";
 import { setTenant } from "./mw/setTenant.js";
 
+import { pool } from "./db.js"; // top of file if not already
+
+
+
 const app = express();
 app.use(express.json({ limit: "1mb" }));   // <-- REQUIRED
 app.use(cookieParser());                   
@@ -26,12 +30,37 @@ app.use(
   })
 );
 
+
+
 // Body & cookies
 app.use(express.json({ limit: "2mb" }));
 app.use(cookieParser());
 
 // Tenant context
 app.use(setTenant);
+
+app.get("/api/debug/db", async (_req, res) => {
+  try {
+    const r = await pool.query("select 1 as ok");
+    res.json({ ok: true, result: r.rows[0] });
+  } catch (e: any) {
+    console.error("[DEBUG /api/debug/db] ERROR:", e);
+    res.status(500).json({ ok: false, error: e?.message || "db failed" });
+  }
+});
+
+// Try reading your users table to confirm schema
+app.get("/api/debug/user", async (_req, res) => {
+  try {
+    const r = await pool.query("select id, email from app_user limit 1");
+    res.json({ ok: true, sample: r.rows });
+  } catch (e: any) {
+    console.error("[DEBUG /api/debug/user] ERROR:", e);
+    res.status(500).json({ ok: false, error: e?.message || "query failed" });
+  }
+});
+
+
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
 });
