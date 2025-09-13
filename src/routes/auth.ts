@@ -11,9 +11,9 @@ export const authRouter = Router();
 /* ------------------------------ Cookie helpers ----------------------------- */
 
 function makeCookieOptions() {
-  // If frontend is on a DIFFERENT origin (Render FE + Render BE), we must use:
-  // SameSite='none' and secure=true. If same-origin, you can change to lax.
-  const crossSite = true; // set to false if same-origin
+  // If frontend is on a DIFFERENT origin (Render FE + Render BE), use SameSite='none' + secure=true.
+  // If same-origin, you can change sameSite to 'lax'.
+  const crossSite = true; // set false if same-origin
   const opts: any = {
     httpOnly: true,
     sameSite: crossSite ? "none" : "lax",
@@ -65,13 +65,19 @@ authRouter.post("/login", async (req: any, res: any) => {
       return res.status(400).json({ error: "Invalid tenant" });
     }
 
-    // Load user (active only). NOTE: expecting column name "password".
-    // If your schema uses "password_hash", change it below to that column name.
+    // Fetch user (tolerate password vs password_hash, is_active missing)
     const { rows } = await pool.query(
-      `SELECT id, email, password, tenant_id, is_active
-       FROM app_user
-       WHERE email = $1
-       LIMIT 1`,
+      `
+      SELECT
+        id,
+        email,
+        COALESCE(password, password_hash) AS password,
+        tenant_id,
+        COALESCE(is_active, true) AS is_active
+      FROM app_user
+      WHERE email = $1
+      LIMIT 1
+      `,
       [email]
     );
 
@@ -95,6 +101,9 @@ authRouter.post("/login", async (req: any, res: any) => {
     const tokenHash = crypto.createHash("sha256").update(rid).digest("hex");
     const effectiveTenantId = user.tenant_id ?? tenantIdFromSlug ?? null;
 
+    // If your sessions/refresh_tokens require tenant_id NOT NULL, enforce here:
+    // if (!effectiveTenantId) return res.status(400).json({ error: "Tenant not resolved for user" });
+
     // 8h absolute session expiry
     await pool.query(
       `INSERT INTO sessions (sid, user_id, tenant_id, device, absolute_expiry)
@@ -108,10 +117,12 @@ authRouter.post("/login", async (req: any, res: any) => {
       ]
     );
 
-    // 30d refresh token
+    // Match your refresh_tokens schema exactly:
+    // "rid","sid","user_id","tenant_id","token_hash","replaced_by_token_hash","revoked","created_at","expires_at"
     await pool.query(
-      `INSERT INTO refresh_tokens (rid, sid, user_id, tenant_id, token_hash, revoked, expires_at)
-       VALUES ($1, $2, $3, $4, $5, false, $6)`,
+      `INSERT INTO refresh_tokens (
+         rid, sid, user_id, tenant_id, token_hash, replaced_by_token_hash, revoked, created_at, expires_at
+       ) VALUES ($1, $2, $3, $4, $5, NULL, false, NOW(), $6)`,
       [rid, sid, user.id, effectiveTenantId, tokenHash, dayjs().add(30, "days").toDate()]
     );
 
@@ -119,6 +130,10 @@ authRouter.post("/login", async (req: any, res: any) => {
     return res.json({ ok: true });
   } catch (err: any) {
     console.error("[AUTH /login] ERROR:", err);
+    // Optional: expose detail only when DEBUG=1
+    if (process.env.DEBUG === "1") {
+      return res.status(500).json({ error: "Login failed", detail: String(err?.message || err) });
+    }
     return res.status(500).json({ error: "Login failed" });
   }
 });
