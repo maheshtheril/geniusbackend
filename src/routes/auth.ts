@@ -8,6 +8,23 @@ import dayjs from "dayjs";
 
 export const authRouter = Router();
 
+// Quick router-up check
+authRouter.get("/__up", (_req, res) => res.json({ ok: true, router: "auth" }));
+
+// List the routes registered on this router
+authRouter.get("/__routes", (_req: any, res: any) => {
+  try {
+    // @ts-ignore
+    const stack = (authRouter as any).stack || [];
+    const routes = stack
+      .filter((l: any) => l.route)
+      .map((l: any) => ({ path: l.route.path, methods: Object.keys(l.route.methods) }));
+    res.json({ ok: true, routes });
+  } catch (e: any) {
+    res.status(500).json({ ok: false, error: e?.message || "inspect failed" });
+  }
+});
+
 /* ------------------------------ cookie helpers ----------------------------- */
 function cookieOpts() {
   return {
