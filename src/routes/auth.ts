@@ -128,7 +128,7 @@ authRouter.post("/login", async (req: any, res: any) => {
     const { rows } = await pool.query(
       `SELECT id,
               email,
-              COALESCE(password, password_hash) AS password,
+              password,
               tenant_id,
               COALESCE(is_active, true) AS is_active
        FROM app_user
