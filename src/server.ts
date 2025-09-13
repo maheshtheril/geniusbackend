@@ -13,7 +13,8 @@ import { requireAuth } from "./util/requireAuth.js";
 import { setTenant } from "./mw/setTenant.js";
 
 const app = express();
-
+app.use(express.json({ limit: "1mb" }));   // <-- REQUIRED
+app.use(cookieParser());                   
 // Trust Render's proxy so Secure cookies (SameSite=None) work
 app.set("trust proxy", 1);
 
