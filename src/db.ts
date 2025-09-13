@@ -1,25 +1,20 @@
 // src/db.ts
 import { Pool } from "pg";
 
-const connectionString = process.env.DATABASE_URL;
-if (!connectionString) {
-  console.error("[DB] Missing DATABASE_URL");
-}
-
-const useSSL =
-  process.env.PGSSL?.toLowerCase() === "true" ||
-  // Render-managed Postgres usually needs SSL in prod
-  process.env.NODE_ENV === "production";
-
+// Render Postgres needs explicit TLS + SNI. ?sslmode=require is ignored by node-postgres.
 export const pool = new Pool({
-  connectionString,
-  ssl: useSSL ? { rejectUnauthorized: false } : undefined,
-  // optional timeouts to avoid hanging -> 502s
-  connectionTimeoutMillis: 8000,
-  idleTimeoutMillis: 30000,
-  max: Number(process.env.PGPOOL_MAX || 10),
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false,
+    // This must match the certificate CN Render presents in ap-southeast-1:
+    servername: "aws-ap-southeast-1-1-postgres.render.com",
+  },
+  keepAlive: true,
+  max: 10,
+  connectionTimeoutMillis: 10_000,
+  idleTimeoutMillis: 30_000,
 });
 
 pool.on("error", (err) => {
-  console.error("[DB] Pool error:", err);
+  console.error("❌ PG pool error:", err);
 });
