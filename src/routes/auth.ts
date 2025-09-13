@@ -8,29 +8,24 @@ import dayjs from "dayjs";
 
 export const authRouter = Router();
 
-// Quick router-up check
+/* -------------------------------- debug ----------------------------------- */
 authRouter.get("/__up", (_req, res) => res.json({ ok: true, router: "auth" }));
-
-// List the routes registered on this router
 authRouter.get("/__routes", (_req: any, res: any) => {
-  try {
-    // @ts-ignore
-    const stack = (authRouter as any).stack || [];
-    const routes = stack
-      .filter((l: any) => l.route)
-      .map((l: any) => ({ path: l.route.path, methods: Object.keys(l.route.methods) }));
-    res.json({ ok: true, routes });
-  } catch (e: any) {
-    res.status(500).json({ ok: false, error: e?.message || "inspect failed" });
-  }
+  // Inspect registered routes on this router
+  // @ts-ignore
+  const stack = (authRouter as any).stack || [];
+  const routes = stack
+    .filter((l: any) => l.route)
+    .map((l: any) => ({ path: l.route.path, methods: Object.keys(l.route.methods) }));
+  res.json({ ok: true, routes });
 });
 
-/* ------------------------------ cookie helpers ----------------------------- */
+/* ------------------------------ cookie utils ------------------------------ */
 function cookieOpts() {
   return {
     httpOnly: true,
-    sameSite: "none" as const,
-    secure: true,
+    sameSite: "none" as const, // required for cross-site cookies
+    secure: true,              // required when SameSite=None
     path: "/",
   };
 }
@@ -45,88 +40,12 @@ function clearCookies(res: any) {
   res.clearCookie("rid", opts);
 }
 
-/* ------------------------------- bootstrap --------------------------------- */
-/** Create minimal schema if missing (safe to run multiple times). */
-let bootstrapped = false;
-async function bootstrapDbOnce() {
-  if (bootstrapped) return;
-  // extension + tables (no FK on tenant to avoid extra dependencies)
-  await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS app_user (
-      id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-      email       text UNIQUE NOT NULL,
-      password    text NOT NULL,
-      tenant_id   uuid NULL,
-      full_name   text,
-      role        text,
-      is_active   boolean NOT NULL DEFAULT true,
-      created_at  timestamptz NOT NULL DEFAULT now()
-    );
-  `);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS sessions (
-      sid             text PRIMARY KEY,
-      user_id         uuid NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
-      tenant_id       uuid NULL,
-      device          text,
-      absolute_expiry timestamptz NOT NULL,
-      created_at      timestamptz NOT NULL DEFAULT now()
-    );
-  `);
-
-  /* Columns you listed earlier for refresh_tokens */
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS refresh_tokens (
-      rid                     text PRIMARY KEY,
-      sid                     text NOT NULL REFERENCES sessions(sid) ON DELETE CASCADE,
-      user_id                 uuid NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
-      tenant_id               uuid NULL,
-      token_hash              text NOT NULL,
-      replaced_by_token_hash  text NULL,
-      revoked                 boolean NOT NULL DEFAULT false,
-      created_at              timestamptz NOT NULL DEFAULT now(),
-      expires_at              timestamptz NOT NULL
-    );
-  `);
-
-  bootstrapped = true;
-}
-
-/** Ensure the login email exists; if not, create with the given password (bcrypt). */
-async function ensureUser(email: string, plainPassword: string) {
-  const { rows } = await pool.query(
-    `SELECT id, password, tenant_id, is_active FROM app_user WHERE email=$1 LIMIT 1`,
-    [email]
-  );
-  if (rows[0]) return rows[0];
-
-  const hash = await bcrypt.hash(plainPassword, 10);
-  const insert = await pool.query(
-    `INSERT INTO app_user (email, password, full_name, role, is_active)
-     VALUES ($1,$2,'Admin','admin',true)
-     RETURNING id, password, tenant_id, is_active`,
-    [email, hash]
-  );
-  return insert.rows[0];
-}
-
-/* --------------------------------- routes ---------------------------------- */
-
-/**
- * POST /api/auth/login
- * Body: { email, password }
- * - Bootstraps tables.
- * - Seeds user with given email on first login attempt (idempotent).
- * - Issues sid/rid cookies.
- */
+/* ---------------------------- optional seeding ---------------------------- */
 /**
  * POST /api/auth/seed-admin
- * One-time, token-gated seeding endpoint to create minimal tables and an admin user.
- * Headers:  X-Seed-Token: <ADMIN_SEED_TOKEN>
- * Body:     { email: string, password: string }
+ * Headers: X-Seed-Token: <ADMIN_SEED_TOKEN>
+ * Body: { email, password }
+ * Creates/normalizes tables and upserts an admin user.
  */
 authRouter.post("/seed-admin", async (req: any, res: any) => {
   try {
@@ -134,27 +53,20 @@ authRouter.post("/seed-admin", async (req: any, res: any) => {
     if (!token || token !== process.env.ADMIN_SEED_TOKEN) {
       return res.status(401).json({ ok: false, error: "unauthorized" });
     }
-
     const { email, password } = req.body ?? {};
     if (!email || !password) {
       return res.status(400).json({ ok: false, error: "email and password required" });
     }
 
-    // 1) Minimal schema (idempotent)
     await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
 
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS app_user (
-        id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-        email       text UNIQUE NOT NULL,
-        password    text NOT NULL,
-        tenant_id   uuid NULL,
-        full_name   text,
-        role        text,
-        is_active   boolean NOT NULL DEFAULT true,
-        created_at  timestamptz NOT NULL DEFAULT now()
-      );
-    `);
+    // Ensure columns exist on older schemas
+    await pool.query(`ALTER TABLE app_user ADD COLUMN IF NOT EXISTS password   text`);
+    await pool.query(`ALTER TABLE app_user ADD COLUMN IF NOT EXISTS full_name  text`);
+    await pool.query(`ALTER TABLE app_user ADD COLUMN IF NOT EXISTS role       text`);
+    await pool.query(`ALTER TABLE app_user ADD COLUMN IF NOT EXISTS is_active  boolean`);
+    await pool.query(`ALTER TABLE app_user ADD COLUMN IF NOT EXISTS tenant_id  uuid`);
+    await pool.query(`ALTER TABLE app_user ADD COLUMN IF NOT EXISTS created_at timestamptz`);
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS sessions (
@@ -181,11 +93,10 @@ authRouter.post("/seed-admin", async (req: any, res: any) => {
       );
     `);
 
-    // 2) Upsert admin user with bcrypt
     const hash = await bcrypt.hash(password, 10);
     await pool.query(
-      `INSERT INTO app_user (email, password, full_name, role, is_active)
-       VALUES ($1,$2,'Admin','admin',true)
+      `INSERT INTO app_user (email, password, full_name, role, is_active, created_at)
+       VALUES ($1,$2,'Admin','admin',true, NOW())
        ON CONFLICT (email) DO UPDATE
          SET password = EXCLUDED.password,
              full_name = 'Admin',
@@ -201,37 +112,93 @@ authRouter.post("/seed-admin", async (req: any, res: any) => {
   }
 });
 
+/* --------------------------------- LOGIN ---------------------------------- */
+/**
+ * POST /api/auth/login
+ * Body: { email, password }
+ */
+authRouter.post("/login", async (req: any, res: any) => {
+  try {
+    const { email, password } = req.body ?? {};
+    if (!email || !password) {
+      return res.status(400).json({ error: "Email and password required" });
+    }
 
-/** POST /api/auth/logout */
+    // tolerate either password or password_hash column
+    const { rows } = await pool.query(
+      `SELECT id,
+              email,
+              COALESCE(password, password_hash) AS password,
+              tenant_id,
+              COALESCE(is_active, true) AS is_active
+       FROM app_user
+       WHERE email = $1
+       LIMIT 1`,
+      [email]
+    );
+
+    const user = rows[0];
+    if (!user || user.is_active === false) {
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    const ok = user.password ? await bcrypt.compare(password, user.password) : false;
+    if (!ok) return res.status(401).json({ error: "Invalid credentials" });
+
+    const sid = uuid();
+    const rid = uuid();
+    const tokenHash = crypto.createHash("sha256").update(rid).digest("hex");
+
+    await pool.query(
+      `INSERT INTO sessions (sid, user_id, tenant_id, device, absolute_expiry, created_at)
+       VALUES ($1,$2,$3,$4,$5,NOW())
+       ON CONFLICT (sid) DO NOTHING`,
+      [sid, user.id, user.tenant_id ?? null, req.headers["user-agent"] || null, dayjs().add(8, "hours").toDate()]
+    );
+
+    await pool.query(
+      `INSERT INTO refresh_tokens (
+         rid, sid, user_id, tenant_id, token_hash, replaced_by_token_hash, revoked, created_at, expires_at
+       ) VALUES ($1,$2,$3,$4,$5,NULL,false,NOW(),$6)`,
+      [rid, sid, user.id, user.tenant_id ?? null, tokenHash, dayjs().add(30, "days").toDate()]
+    );
+
+    setCookies(res, sid, rid);
+    return res.json({ ok: true });
+  } catch (err: any) {
+    console.error("[AUTH /login] ERROR:", err);
+    return res.status(500).json({ error: "Login failed" });
+  }
+});
+
+/* -------------------------------- LOGOUT ---------------------------------- */
 authRouter.post("/logout", async (req: any, res: any) => {
   try {
     const rid = req?.cookies?.rid as string | undefined;
     const sid = req?.cookies?.sid as string | undefined;
     if (rid) await pool.query(`UPDATE refresh_tokens SET revoked = true WHERE rid = $1`, [rid]);
     if (sid) await pool.query(`DELETE FROM sessions WHERE sid = $1`, [sid]);
-  } catch (e) {
-    console.error("[AUTH /logout] ERROR:", (e as any)?.message);
+  } catch (e: any) {
+    console.error("[AUTH /logout] ERROR:", e?.message || e);
   } finally {
     clearCookies(res);
     return res.json({ ok: true });
   }
 });
 
-/** GET /api/auth/status */
+/* -------------------------------- STATUS ---------------------------------- */
 authRouter.get("/status", async (req: any, res: any) => {
   try {
     const sid = req?.cookies?.sid as string | undefined;
     if (!sid) return res.json({ ok: true, authenticated: false });
 
     const { rows } = await pool.query(
-      `
-      SELECT s.sid, s.user_id, s.tenant_id, s.absolute_expiry,
-             u.email, u.full_name, u.role
-      FROM sessions s
-      JOIN app_user u ON u.id = s.user_id
-      WHERE s.sid = $1
-      LIMIT 1
-      `,
+      `SELECT s.sid, s.user_id, s.tenant_id, s.absolute_expiry,
+              u.email, u.full_name, u.role
+       FROM sessions s
+       JOIN app_user u ON u.id = s.user_id
+       WHERE s.sid = $1
+       LIMIT 1`,
       [sid]
     );
 
