@@ -32,6 +32,9 @@ app.use(cookieParser());
 
 // Tenant context
 app.use(setTenant);
+app.get("/api/health", (_req, res) => {
+  res.json({ ok: true, ts: new Date().toISOString() });
+});
 
 // ---- Health & root (fixes "Cannot GET /") ----
 app.get("/healthz", (_req, res) => res.status(200).send("ok"));
